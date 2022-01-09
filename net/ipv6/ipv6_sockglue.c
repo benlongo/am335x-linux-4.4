@@ -48,6 +48,8 @@
 #include <net/addrconf.h>
 #include <net/inet_common.h>
 #include <net/tcp.h>
+#include <net/mptcp.h>
+#include <net/mptcp_v4.h>
 #include <net/udp.h>
 #include <net/udplite.h>
 #include <net/xfrm.h>
@@ -215,7 +217,12 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 				sock_prot_inuse_add(net, &tcp_prot, 1);
 				local_bh_enable();
 				sk->sk_prot = &tcp_prot;
-				icsk->icsk_af_ops = &ipv4_specific;
+#ifdef CONFIG_MPTCP
+				if (sock_flag(sk, SOCK_MPTCP))
+					icsk->icsk_af_ops = &mptcp_v4_specific;
+				else
+#endif
+					icsk->icsk_af_ops = &ipv4_specific;
 				sk->sk_socket->ops = &inet_stream_ops;
 				sk->sk_family = PF_INET;
 				tcp_sync_mss(sk, icsk->icsk_pmtu_cookie);
@@ -241,7 +248,12 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
 			pktopt = xchg(&np->pktoptions, NULL);
 			kfree_skb(pktopt);
 
-			sk->sk_destruct = inet_sock_destruct;
+#ifdef CONFIG_MPTCP
+			if (is_meta_sk(sk))
+				sk->sk_destruct = mptcp_sock_destruct;
+			else
+#endif
+				sk->sk_destruct = inet_sock_destruct;
 			/*
 			 * ... and add it to the refcnt debug socks count
 			 * in the new family. -acme
@@ -583,16 +595,24 @@ done:
 
 		if (val) {
 			struct net_device *dev;
+			int midx;
 
-			if (sk->sk_bound_dev_if && sk->sk_bound_dev_if != val)
-				goto e_inval;
+			rcu_read_lock();
 
-			dev = dev_get_by_index(net, val);
+			dev = dev_get_by_index_rcu(net, val);
 			if (!dev) {
+				rcu_read_unlock();
 				retv = -ENODEV;
 				break;
 			}
-			dev_put(dev);
+			midx = l3mdev_master_ifindex_rcu(dev);
+
+			rcu_read_unlock();
+
+			if (sk->sk_bound_dev_if &&
+			    sk->sk_bound_dev_if != val &&
+			    (!midx || midx != sk->sk_bound_dev_if))
+				goto e_inval;
 		}
 		np->mcast_oif = val;
 		retv = 0;
@@ -864,6 +884,7 @@ pref_skip_coa:
 		break;
 	case IPV6_AUTOFLOWLABEL:
 		np->autoflowlabel = valbool;
+		np->autoflowlabel_set = 1;
 		retv = 0;
 		break;
 	}
